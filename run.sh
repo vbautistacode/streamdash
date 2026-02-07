@@ -37,3 +37,5 @@ exec "${STREAMLIT_CMD}" run "${APP_ENTRY}" --server.port 8501
 # dar permissão e executar
 chmod +x run.sh
 ./run.sh
+
+#python -m streamlit run app/main.py
