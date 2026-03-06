@@ -1,6 +1,6 @@
 # db/seed_db.py
-
 import pandas as pd
+import sqlite3
 from db.models import get_connection, create_tables
 
 def _delete_existing(conn, table, tenant, mes):
@@ -8,16 +8,58 @@ def _delete_existing(conn, table, tenant, mes):
     cur.execute(f"DELETE FROM {table} WHERE tenant_id = ? AND mes = ?", (tenant, mes))
     conn.commit()
 
+def _get_table_columns(conn, table):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    rows = cur.fetchall()
+    # rows: (cid, name, type, notnull, dflt_value, pk)
+    return [r[1] for r in rows]
+
+def _add_column_if_missing(conn, table, col, col_type="REAL"):
+    existing = _get_table_columns(conn, table)
+    if col in existing:
+        return
+    cur = conn.cursor()
+    # SQLite ALTER TABLE ADD COLUMN is limited but fine for adding nullable columns
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+    conn.commit()
+
+def _ensure_table_columns_for_df(conn, table, df):
+    """
+    Garante que a tabela 'table' tenha todas as colunas presentes em df.
+    Tipos: se o nome parecer numérico, cria como REAL; senão TEXT.
+    """
+    existing = _get_table_columns(conn, table)
+    for col in df.columns:
+        if col in existing:
+            continue
+        # heurística simples para tipo
+        if col.lower() in {
+            "ebitda", "lucro_liquido", "valor_firma", "valor_mercado",
+            "patrimonio_liquido", "divida_liquida", "divida_bruta",
+            "entradas", "saidas", "saldo", "caixa", "receita", "receita_bruta",
+            "investimento", "preco_acao", "numero_papeis", "free_float"
+        } or col.lower().endswith(("_pct", "_rate")):
+            col_type = "REAL"
+        else:
+            col_type = "TEXT"
+        _add_column_if_missing(conn, table, col, col_type=col_type)
+
 def _upsert_dataframe(conn, table, df):
     """
     Para cada linha do df, remove o registro existente (tenant_id, mes) e insere a linha.
+    Antes de inserir, garante que a tabela tenha as colunas do DataFrame.
     """
+    # garantir colunas na tabela
+    _ensure_table_columns_for_df(conn, table, df)
+
     for _, row in df.iterrows():
         tenant = row.get("tenant_id")
         mes = row.get("mes")
         if tenant is None or mes is None:
             continue
         _delete_existing(conn, table, tenant, mes)
+    # agora append; colunas extras já foram adicionadas à tabela
     df.to_sql(table, conn, if_exists="append", index=False)
 
 def seed_db():
@@ -40,7 +82,6 @@ def seed_db():
         "caixa": []
     }
 
-    # valores base para clienteA e clienteB (crescimento leve mês a mês)
     base = {
         "clienteA": {
             "entradas": [25000.0, 26000.0, 27000.0],
@@ -69,12 +110,10 @@ def seed_db():
             data_fin["caixa"].append(caixa)
 
     df_fin = pd.DataFrame(data_fin)
-    _upsert_dataframe(conn, "indicadores_financeiros", df_fin)
 
     # -----------------------------
     # DRE Financeira
     # -----------------------------
-    # exemplo de evolução mensal leve
     data_dre = {
         "tenant_id": [],
         "mes": [],
@@ -134,6 +173,62 @@ def seed_db():
             data_dre["imposto_renda"].append(vals["ir"][i])
 
     df_dre = pd.DataFrame(data_dre)
+
+    # --- calcular EBITDA e Lucro Líquido a partir do DRE ---
+    def _to_num_safe(v):
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def compute_ebitda_row(r):
+        rb = _to_num_safe(r.get("receita_bruta") or r.get("receita") or 0)
+        cpv = _to_num_safe(r.get("custo_produto_vendido") or 0)
+        csp = _to_num_safe(r.get("custo_servico_prestado") or 0)
+        desp_v = _to_num_safe(r.get("despesas_vendas") or 0)
+        desp_a = _to_num_safe(r.get("despesas_administrativas") or 0)
+        outras = _to_num_safe(r.get("outras_despesas") or 0)
+        return rb - cpv - csp - desp_v - desp_a - outras
+
+    def compute_lucro_liquido_row(r):
+        ebitda = compute_ebitda_row(r)
+        rec_fin = _to_num_safe(r.get("receitas_financeiras") or 0)
+        desp_fin = _to_num_safe(r.get("despesas_financeiras") or 0)
+        ir = _to_num_safe(r.get("imposto_renda") or 0)
+        return ebitda + rec_fin - desp_fin - ir
+
+    df_dre["ebitda"] = df_dre.apply(compute_ebitda_row, axis=1)
+    df_dre["lucro_liquido"] = df_dre.apply(compute_lucro_liquido_row, axis=1)
+
+    # garantir tipos numéricos no DRE
+    for col in [
+        "receita_bruta", "custo_produto_vendido", "custo_servico_prestado",
+        "despesas_vendas", "despesas_administrativas", "outras_despesas",
+        "receitas_financeiras", "despesas_financeiras", "imposto_renda",
+        "ebitda", "lucro_liquido"
+    ]:
+        if col in df_dre.columns:
+            df_dre[col] = pd.to_numeric(df_dre[col], errors="coerce")
+
+    # --- mapear ebitda/lucro para indicadores_financeiros (df_fin) ---
+    for col in ["ebitda", "lucro_liquido"]:
+        if col not in df_fin.columns:
+            df_fin[col] = None
+
+    if not df_dre.empty:
+        for _, r in df_dre.iterrows():
+            mask = (df_fin["tenant_id"] == r["tenant_id"]) & (df_fin["mes"] == r["mes"])
+            if mask.any():
+                df_fin.loc[mask, "ebitda"] = r["ebitda"]
+                df_fin.loc[mask, "lucro_liquido"] = r["lucro_liquido"]
+
+    # converter colunas numéricas em df_fin
+    for col in ["entradas", "saidas", "saldo", "caixa", "ebitda", "lucro_liquido"]:
+        if col in df_fin.columns:
+            df_fin[col] = pd.to_numeric(df_fin[col], errors="coerce")
+
+    # persistir indicadores_financeiros e dre_financeiro (garante colunas antes de inserir)
+    _upsert_dataframe(conn, "indicadores_financeiros", df_fin)
     _upsert_dataframe(conn, "dre_financeiro", df_dre)
 
     # -----------------------------
@@ -146,8 +241,7 @@ def seed_db():
     }
 
     vendas_base = {
-        "clienteA": {
-            "volume": [50, 52, 55]},
+        "clienteA": {"volume": [50, 52, 55]},
         "clienteB": {"volume": [40, 41, 43]}
     }
 
@@ -173,20 +267,9 @@ def seed_db():
         "producao": []
     }
 
-    # preenchimento plausível a partir dos valores originais:
     op_base = {
-        "clienteA": {
-            "prod": [95.0, 95.5, 96.0],   # mapeado para producao
-            "vendedores": [5, 5, 5],     # valor plausível constante
-            "quantidade": [120, 125, 130],# exemplo de unidades produzidas
-            "vendas": [50, 52, 55]        # igual ao volume de vendas
-        },
-        "clienteB": {
-            "prod": [90.0, 90.5, 91.0],
-            "vendedores": [4, 4, 4],
-            "quantidade": [90, 95, 98],
-            "vendas": [40, 41, 43]
-        }
+        "clienteA": {"prod": [95.0, 95.5, 96.0], "vendedores": [5, 5, 5], "quantidade": [120, 125, 130], "vendas": [50, 52, 55]},
+        "clienteB": {"prod": [90.0, 90.5, 91.0], "vendedores": [4, 4, 4], "quantidade": [90, 95, 98], "vendas": [40, 41, 43]}
     }
 
     for tenant in tenants:
@@ -205,7 +288,6 @@ def seed_db():
     # -----------------------------
     # Indicadores de Marketing
     # -----------------------------
-    
     data_mkt = {
         "tenant_id": [],
         "mes": [],
@@ -215,16 +297,8 @@ def seed_db():
     }
 
     mkt_base = {
-        "clienteA": {
-            "receita": [25000.0, 26000.0, 27000.0],
-            "invest": [6000.0, 6200.0, 6400.0],
-            "leads": [200, 210, 220]
-        },
-        "clienteB": {
-            "receita": [18000.0, 18500.0, 19000.0],
-            "invest": [4000.0, 4200.0, 4400.0],
-            "leads": [150, 155, 160]
-        }
+        "clienteA": {"receita": [25000.0, 26000.0, 27000.0], "invest": [6000.0, 6200.0, 6400.0], "leads": [200, 210, 220]},
+        "clienteB": {"receita": [18000.0, 18500.0, 19000.0], "invest": [4000.0, 4200.0, 4400.0], "leads": [150, 155, 160]}
     }
 
     for tenant in tenants:
@@ -249,12 +323,8 @@ def seed_db():
     }
 
     cli_base = {
-        "clienteA": {
-            "ativos": [60, 62, 64]
-        },
-        "clienteB": {
-            "ativos": [45, 46, 47]
-        }
+        "clienteA": {"ativos": [60, 62, 64]},
+        "clienteB": {"ativos": [45, 46, 47]}
     }
 
     for tenant in tenants:
@@ -329,6 +399,24 @@ def seed_db():
             data_contabil["tipo_empresa"].append(vals["tipo_empresa"])
 
     df_cont = pd.DataFrame(data_contabil)
+
+    # --- garantir colunas numéricas e calcular valor_firma ---
+    for col in ["patrimonio_liquido", "divida_liquida", "divida_bruta", "ativos", "disponibilidade"]:
+        if col in df_cont.columns:
+            df_cont[col] = pd.to_numeric(df_cont[col], errors="coerce")
+
+    if "valor_firma" not in df_cont.columns:
+        df_cont["valor_firma"] = None
+
+    for idx, r in df_cont.iterrows():
+        pl = _to_num_safe(r.get("patrimonio_liquido"))
+        div_liq = _to_num_safe(r.get("divida_liquida"))
+        if div_liq == 0:
+            div_liq = _to_num_safe(r.get("divida_bruta"))
+        df_cont.at[idx, "valor_firma"] = pl + div_liq
+
+    df_cont["valor_firma"] = pd.to_numeric(df_cont["valor_firma"], errors="coerce")
+
     _upsert_dataframe(conn, "dados_contabeis", df_cont)
 
     conn.close()
@@ -336,6 +424,3 @@ def seed_db():
 
 if __name__ == "__main__":
     seed_db()
-
-# Rodar este script irá popular o banco de dados com dados financeiros e contábeis fictícios para dois clientes: um de capital aberto e outro de capital fechado.
-#python -m db.seed_db
