@@ -2,6 +2,27 @@
 import streamlit as st
 from app.auth.auth_utils import get_connection, get_user_by_username, verify_password, is_admin
 
+def safe_rerun():
+    """
+    Tenta reiniciar o app de forma compatível com várias versões do Streamlit.
+    - tenta st.experimental_rerun()
+    - tenta st.rerun()
+    - fallback: marca flag e interrompe com st.stop()
+    """
+    try:
+        if hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+            return
+        if hasattr(st, "rerun"):
+            st.rerun()
+            return
+    except Exception:
+        # se a chamada falhar por qualquer motivo, cair no fallback
+        pass
+    # fallback: sinalizar e parar para que o fluxo do app seja reiniciado manualmente
+    st.session_state["_needs_rerun"] = True
+    st.stop()
+
 def show_login():
     # Inicializa estado
     if "authenticated" not in st.session_state:
@@ -9,6 +30,7 @@ def show_login():
         st.session_state["role"] = None
         st.session_state["user_name"] = None
         st.session_state["remember"] = False
+        st.session_state["_needs_rerun"] = False
 
     # Se já autenticado, mostra logout na sidebar e sai da função
     if st.session_state.get("authenticated", False):
@@ -22,9 +44,10 @@ def show_login():
             st.session_state["role"] = None
             st.session_state["user_name"] = None
             st.session_state["remember"] = False
-            st.experimental_rerun()
+            safe_rerun()
         return
 
+    # Formulário empilhado: Usuário acima, Senha abaixo
     with st.form(key="login_form", clear_on_submit=False):
         cols = st.columns([0.5, 0.5])
         with cols[0]:
@@ -32,7 +55,6 @@ def show_login():
             password = st.text_input("Senha", type="password", placeholder="••••••", key="login_pass")
             remember = st.checkbox("Lembrar", value=False, key="login_remember")
             # botão em coluna para alinhamento opcional
-        
             submit = st.form_submit_button("Entrar")
 
         if submit:
@@ -51,7 +73,7 @@ def show_login():
                 st.session_state["user_name"] = user.get("name") or username_norm
                 st.session_state["remember"] = bool(remember)
                 st.success(f"Bem‑vindo {st.session_state['user_name']}!")
-                st.experimental_rerun()
+                safe_rerun()
             else:
                 st.error("Usuário ou senha incorretos")
 
