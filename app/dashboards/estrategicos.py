@@ -14,10 +14,231 @@ except Exception:
     forecast_trend = None
     recommend_actions = None
 
+# utilitários defensivos para KPIs
+def _to_num(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def _safe_div(a, b):
+    try:
+        a = _to_num(a)
+        b = _to_num(b)
+        if a is None or b is None:
+            return None
+        if b == 0 or math.isinf(a) or math.isinf(b) or math.isnan(a) or math.isnan(b):
+            return None
+        return a / b
+    except Exception:
+        return None
+
+def _compute_ebitda_from_dre_row(r):
+    # EBITDA ≈ receita_bruta - cpv - csp - despesas_vendas - despesas_administrativas - outras_despesas
+    try:
+        rb = _to_num(r.get("receita_bruta") or r.get("receita") or 0) or 0
+        cpv = _to_num(r.get("custo_produto_vendido") or 0) or 0
+        csp = _to_num(r.get("custo_servico_prestado") or 0) or 0
+        dv = _to_num(r.get("despesas_vendas") or 0) or 0
+        da = _to_num(r.get("despesas_administrativas") or 0) or 0
+        od = _to_num(r.get("outras_despesas") or 0) or 0
+        return rb - cpv - csp - dv - da - od
+    except Exception:
+        return None
+
+def _compute_cagr(series, periods_per_year=12):
+    # series: pd.Series indexed by time-ordered values (numeric). returns CAGR decimal or None
+    try:
+        s = pd.to_numeric(series.dropna(), errors="coerce")
+        if s.empty or len(s) < 2:
+            return None
+        first = float(s.iloc[0])
+        last = float(s.iloc[-1])
+        if first <= 0 or last <= 0:
+            return None
+        n_periods = len(s) - 1
+        years = n_periods / periods_per_year
+        if years <= 0:
+            return None
+        return (last / first) ** (1.0 / years) - 1.0
+    except Exception:
+        return None
+
+def compute_kpis_from_dfs(df_fin: Optional[pd.DataFrame], df_cont: Optional[pd.DataFrame]):
+    """
+    Retorna dict com chaves por tenant e agregados:
+    {
+      "per_tenant": { tenant_id: {"ebitda":..., "margem_liquida":..., "roi":..., "roe":..., "cagr_receitas":..., "divida_ebitda":...}, ...},
+      "aggregate": {"ebitda_total":..., "roi":..., ...}
+    }
+    """
+    out = {"per_tenant": {}, "aggregate": {}}
+    if df_fin is None:
+        df_fin = pd.DataFrame()
+    if df_cont is None:
+        df_cont = pd.DataFrame()
+
+    # normalizar tipos
+    for col in ["ebitda", "lucro_liquido", "receita", "receita_bruta", "divida_liquida", "patrimonio_liquido"]:
+        if col in df_fin.columns:
+            df_fin[col] = pd.to_numeric(df_fin[col], errors="coerce")
+        if col in df_cont.columns:
+            df_cont[col] = pd.to_numeric(df_cont[col], errors="coerce")
+
+    tenants = set()
+    if "tenant_id" in df_fin.columns:
+        tenants.update(df_fin["tenant_id"].dropna().unique().tolist())
+    if "tenant_id" in df_cont.columns:
+        tenants.update(df_cont["tenant_id"].dropna().unique().tolist())
+    if not tenants:
+        tenants = {None}
+
+    # processar por tenant
+    ebitda_sum = 0.0
+    ebitda_count = 0
+    roi_vals = []
+    roe_vals = []
+    cagr_vals = []
+    div_ebitda_vals = []
+
+    for tenant in tenants:
+        tmask_fin = df_fin["tenant_id"] == tenant if "tenant_id" in df_fin.columns else pd.Series([False]*len(df_fin))
+        tmask_cont = df_cont["tenant_id"] == tenant if "tenant_id" in df_cont.columns else pd.Series([False]*len(df_cont))
+
+        df_t_fin = df_fin[tmask_fin].copy() if not df_fin.empty else pd.DataFrame()
+        df_t_cont = df_cont[tmask_cont].copy() if not df_cont.empty else pd.DataFrame()
+
+        # EBITDA: prefer coluna em indicadores_financeiros; fallback para DRE
+        ebitda = None
+        if "ebitda" in df_t_fin.columns and not df_t_fin["ebitda"].dropna().empty:
+            ebitda = float(df_t_fin["ebitda"].dropna().astype(float).sum())  # soma do período
+        else:
+            # tentar calcular a partir de dre_financeiro (se estiver no mesmo df_fin ou em outro DF)
+            if "receita_bruta" in df_t_fin.columns or "receita_bruta" in df_fin.columns:
+                # tentar usar linhas correspondentes por mes
+                try:
+                    # se df_fin contém colunas DRE, calc por linha
+                    if "receita_bruta" in df_t_fin.columns:
+                        ebitda_series = df_t_fin.apply(_compute_ebitda_from_dre_row, axis=1)
+                        if not ebitda_series.dropna().empty:
+                            ebitda = float(ebitda_series.sum())
+                except Exception:
+                    ebitda = None
+
+        # Margem líquida: média do período = mean(lucro_liquido / receita)
+        margem_liq = None
+        if "lucro_liquido" in df_t_fin.columns and ("receita" in df_t_fin.columns or "receita_bruta" in df_t_fin.columns):
+            rev_col = "receita" if "receita" in df_t_fin.columns else "receita_bruta"
+            ratios = []
+            for _, r in df_t_fin.iterrows():
+                lucro = _to_num(r.get("lucro_liquido"))
+                rev = _to_num(r.get(rev_col))
+                val = _safe_div(lucro, rev)
+                if val is not None:
+                    ratios.append(val)
+            margem_liq = float(pd.Series(ratios).mean()) if ratios else None
+
+        # ROE: lucro_liquido / patrimonio_liquido (usar último patrimônio)
+        roe = None
+        last_pl = None
+        if not df_t_cont.empty and "patrimonio_liquido" in df_t_cont.columns:
+            try:
+                last_pl = pd.to_numeric(df_t_cont["patrimonio_liquido"], errors="coerce").dropna()
+                if not last_pl.empty:
+                    last_pl = float(last_pl.iloc[-1])
+            except Exception:
+                last_pl = None
+        # lucro líquido total do período (soma)
+        lucro_total = None
+        if "lucro_liquido" in df_t_fin.columns and not df_t_fin["lucro_liquido"].dropna().empty:
+            lucro_total = float(df_t_fin["lucro_liquido"].dropna().astype(float).sum())
+        if lucro_total is not None and last_pl is not None:
+            roe = _safe_div(lucro_total, last_pl)
+
+        # ROI: se existir coluna 'investimento' usar lucro_total / investimento_total; fallback lucro_total / patrimonio_liquido
+        roi = None
+        invest_total = None
+        if "investimento" in df_t_fin.columns and not df_t_fin["investimento"].dropna().empty:
+            invest_total = float(df_t_fin["investimento"].dropna().astype(float).sum())
+        if lucro_total is not None and invest_total is not None:
+            roi = _safe_div(lucro_total, invest_total)
+        elif lucro_total is not None and last_pl is not None:
+            roi = _safe_div(lucro_total, last_pl)
+
+        # CAGR receitas: usar série de receita (ordenada por mes)
+        cagr = None
+        if "receita" in df_t_fin.columns or "receita_bruta" in df_t_fin.columns:
+            rev_col = "receita" if "receita" in df_t_fin.columns else "receita_bruta"
+            s = df_t_fin.sort_values("mes")[rev_col] if "mes" in df_t_fin.columns else df_t_fin[rev_col]
+            cagr = _compute_cagr(s, periods_per_year=12)
+
+        # Dívida / EBITDA: usar divida_liquida (última) / ebitda (soma ou último)
+        divida_ebitda = None
+        last_div = None
+        if not df_t_cont.empty and "divida_liquida" in df_t_cont.columns:
+            try:
+                last_div = pd.to_numeric(df_t_cont["divida_liquida"], errors="coerce").dropna()
+                if not last_div.empty:
+                    last_div = float(last_div.iloc[-1])
+            except Exception:
+                last_div = None
+        # ebitda for ratio: prefer sum over period, else last
+        ebitda_for_ratio = ebitda
+        if ebitda_for_ratio is None and "ebitda" in df_t_fin.columns and not df_t_fin["ebitda"].dropna().empty:
+            ebitda_for_ratio = float(df_t_fin["ebitda"].dropna().astype(float).iloc[-1])
+        if last_div is not None and ebitda_for_ratio is not None:
+            divida_ebitda = _safe_div(last_div, ebitda_for_ratio)
+
+        # store
+        out["per_tenant"][tenant] = {
+            "ebitda": ebitda,
+            "margem_liquida": margem_liq,
+            "roi": roi,
+            "roe": roe,
+            "cagr_receitas": cagr,
+            "divida_ebitda": divida_ebitda,
+            "lucro_total": lucro_total,
+            "patrimonio_liquido": last_pl,
+            "valor_mercado": None
+        }
+
+        # aggregate trackers
+        if ebitda is not None:
+            ebitda_sum += ebitda
+            ebitda_count += 1
+        if roi is not None:
+            roi_vals.append(roi)
+        if roe is not None:
+            roe_vals.append(roe)
+        if cagr is not None:
+            cagr_vals.append(cagr)
+        if divida_ebitda is not None:
+            div_ebitda_vals.append(divida_ebitda)
+
+    # aggregates
+    out["aggregate"]["ebitda_total"] = ebitda_sum if ebitda_count > 0 else None
+    out["aggregate"]["roi_mean"] = float(pd.Series(roi_vals).mean()) if roi_vals else None
+    out["aggregate"]["roe_mean"] = float(pd.Series(roe_vals).mean()) if roe_vals else None
+    out["aggregate"]["cagr_mean"] = float(pd.Series(cagr_vals).mean()) if cagr_vals else None
+    out["aggregate"]["divida_ebitda_mean"] = float(pd.Series(div_ebitda_vals).mean()) if div_ebitda_vals else None
+
+    return out
+
 def show_estrategicos(df_fin: Optional[pd.DataFrame], df_cont: Optional[pd.DataFrame], modo: str = "Resumido", derived_metrics: Optional[Dict[str, Any]] = None):
     st.subheader("📊 Indicadores Estratégicos")
 
     dm = derived_metrics or {}
+
+    kpis = compute_kpis_from_dfs(df_fin, df_cont)
+    # preencher dm com fallbacks do compute_kpis_from_dfs.aggregate
+    dm.setdefault("ebitda", dm.get("ebitda") or kpis["aggregate"].get("ebitda_total"))
+    dm.setdefault("roi", dm.get("roi") or kpis["aggregate"].get("roi_mean"))
+    dm.setdefault("roe", dm.get("roe") or kpis["aggregate"].get("roe_mean"))
+    dm.setdefault("cagr_receitas", dm.get("cagr_receitas") or kpis["aggregate"].get("cagr_mean"))
+    dm.setdefault("margem_liquida", dm.get("margem_liquida") or kpis["aggregate"].get("margem_mean") if kpis["aggregate"].get("margem_mean") else dm.get("margem_liquida"))
+    dm.setdefault("divida_ebitda", dm.get("divida_ebitda") or kpis["aggregate"].get("divida_ebitda_mean"))
 
     def _safe_mean(df, col):
         try:
