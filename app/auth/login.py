@@ -8,33 +8,34 @@ def show_login():
         st.session_state["authenticated"] = False
         st.session_state["role"] = None
         st.session_state["user_name"] = None
+        st.session_state["remember"] = False
 
     # Se já autenticado, mostra logout na sidebar e sai da função
     if st.session_state.get("authenticated", False):
         role = st.session_state.get("role") or ""
         user_name = st.session_state.get("user_name") or ""
         st.sidebar.success(f"Perfil: {role.capitalize()}" if role else "Perfil")
-        st.sidebar.write(f"Usuário: {user_name}") if user_name else None
+        if user_name:
+            st.sidebar.write(f"Usuário: {user_name}")
         if st.sidebar.button("Logout"):
             st.session_state["authenticated"] = False
             st.session_state["role"] = None
             st.session_state["user_name"] = None
+            st.session_state["remember"] = False
             st.experimental_rerun()
         return
 
-    # Compactar o formulário de login (menos espaço vertical)
-    # Opcional: remover título para reduzir ainda mais o espaço
-    # st.title("🔐 Login")
-
+    # Formulário empilhado: Usuário acima, Senha abaixo
     with st.form(key="login_form", clear_on_submit=False):
-        cols = st.columns([0.8, 0.8, 1])  # username | password | submit
-        username = cols[0].text_input("Usuário", placeholder="seu.usuario", key="login_user")
-        password = cols[1].text_input("Senha", type="password", placeholder="••••••", key="login_pass")
-        #remember = cols[2].checkbox("Lembrar", value=False, key="login_remember")
-        submit = st.form_submit_button("Entrar")
+        username = st.text_input("Usuário", placeholder="seu.usuario", key="login_user")
+        password = st.text_input("Senha", type="password", placeholder="••••••", key="login_pass")
+        remember = st.checkbox("Lembrar", value=False, key="login_remember")
+        # botão em coluna para alinhamento opcional
+        cols = st.columns([1, 0.4])
+        with cols[1]:
+            submit = st.form_submit_button("Entrar")
 
         if submit:
-            # normalizar username
             username_norm = username.strip() if isinstance(username, str) else username
             conn = None
             try:
@@ -48,7 +49,6 @@ def show_login():
                 st.session_state["authenticated"] = True
                 st.session_state["role"] = user.get("role")
                 st.session_state["user_name"] = user.get("name") or username_norm
-                # opcional: persistir preferência "remember" em session_state
                 st.session_state["remember"] = bool(remember)
                 st.success(f"Bem‑vindo {st.session_state['user_name']}!")
                 st.experimental_rerun()
