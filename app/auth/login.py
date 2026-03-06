@@ -26,14 +26,14 @@ def show_login():
     # Opcional: remover título para reduzir ainda mais o espaço
     # st.title("🔐 Login")
 
-    with st.form("login_form", clear_on_submit=False):
-        username = st.text_input("Usuário", key="login_user")
-        password = st.text_input("Senha", type="password", key="login_pass")
-        cols = st.columns([1, 0.3])  # campo vazio + botão menor
-        with cols[1]:
-            submit = st.form_submit_button("Entrar")
-        if submit:
+    with st.form(key="login_form", clear_on_submit=False):
+        cols = st.columns([0.8, 0.8, 1])  # username | password | submit
+        username = cols[0].text_input("Usuário", placeholder="seu.usuario", key="login_user")
+        password = cols[1].text_input("Senha", type="password", placeholder="••••••", key="login_pass")
+        #remember = cols[2].checkbox("Lembrar", value=False, key="login_remember")
+        submit = st.form_submit_button("Entrar")
 
+        if submit:
             # normalizar username
             username_norm = username.strip() if isinstance(username, str) else username
             conn = None
