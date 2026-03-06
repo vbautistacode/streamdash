@@ -7,34 +7,54 @@ def show_login():
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
         st.session_state["role"] = None
+        st.session_state["user_name"] = None
 
-    # Se já autenticado, mostra logout e sai da função
-    if st.session_state["authenticated"]:
-        st.sidebar.success(f"Perfil: {st.session_state['role'].capitalize()}")
+    # Se já autenticado, mostra logout na sidebar e sai da função
+    if st.session_state.get("authenticated", False):
+        role = st.session_state.get("role") or ""
+        user_name = st.session_state.get("user_name") or ""
+        st.sidebar.success(f"Perfil: {role.capitalize()}" if role else "Perfil")
+        st.sidebar.write(f"Usuário: {user_name}") if user_name else None
         if st.sidebar.button("Logout"):
             st.session_state["authenticated"] = False
             st.session_state["role"] = None
+            st.session_state["user_name"] = None
             st.experimental_rerun()
         return
 
-    # Renderiza somente o login
-    st.title("🔐 Login")
+    # Compactar o formulário de login (menos espaço vertical)
+    # Opcional: remover título para reduzir ainda mais o espaço
+    # st.title("🔐 Login")
 
-    username = st.text_input("Usuário")
-    password = st.text_input("Senha", type="password")
+    with st.form(key="login_form", clear_on_submit=False):
+        cols = st.columns([2, 2, 1])  # username | password | submit
+        username = cols[0].text_input("Usuário", placeholder="seu.usuario", key="login_user")
+        password = cols[1].text_input("Senha", type="password", placeholder="••••••", key="login_pass")
+        remember = cols[2].checkbox("Lembrar", value=False, key="login_remember")
+        submit = st.form_submit_button("Entrar")
 
-    if st.button("Entrar"):
-        conn = get_connection()
-        user = get_user_by_username(conn, username)
-        conn.close()
+        if submit:
+            # normalizar username
+            username_norm = username.strip() if isinstance(username, str) else username
+            conn = None
+            try:
+                conn = get_connection()
+                user = get_user_by_username(conn, username_norm)
+            finally:
+                if conn:
+                    conn.close()
 
-        if user and verify_password(password, user["password_hash"]):
-            st.session_state["authenticated"] = True
-            st.session_state["role"] = user["role"]
-            st.success(f"Bem-vindo {user['name']}!")
-            st.rerun()
-        else:
-            st.error("Usuário ou senha incorretos")
+            if user and verify_password(password, user.get("password_hash")):
+                st.session_state["authenticated"] = True
+                st.session_state["role"] = user.get("role")
+                st.session_state["user_name"] = user.get("name") or username_norm
+                # opcional: persistir preferência "remember" em session_state
+                st.session_state["remember"] = bool(remember)
+                st.success(f"Bem‑vindo {st.session_state['user_name']}!")
+                st.experimental_rerun()
+            else:
+                st.error("Usuário ou senha incorretos")
 
     # Se ainda não autenticado, interrompe o app aqui
-    st.stop()
+    if not st.session_state.get("authenticated", False):
+        st.stop()
