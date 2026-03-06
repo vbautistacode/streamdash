@@ -27,7 +27,7 @@ def show_login():
     # st.title("🔐 Login")
 
     with st.form(key="login_form", clear_on_submit=False):
-        cols = st.columns([3, 3, 1])  # username | password | submit
+        cols = st.columns([1, 1, 1])  # username | password | submit
         username = cols[0].text_input("Usuário", placeholder="seu.usuario", key="login_user")
         password = cols[1].text_input("Senha", type="password", placeholder="••••••", key="login_pass")
         #remember = cols[2].checkbox("Lembrar", value=False, key="login_remember")
