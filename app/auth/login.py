@@ -26,14 +26,13 @@ def show_login():
         return
 
     with st.form(key="login_form", clear_on_submit=False):
-        cols = st.columns([1, 0.4])
+        cols = st.columns([0.5, 0.5])
         with cols[0]:
             username = st.text_input("Usuário", placeholder="seu.usuario", key="login_user")
             password = st.text_input("Senha", type="password", placeholder="••••••", key="login_pass")
             remember = st.checkbox("Lembrar", value=False, key="login_remember")
             # botão em coluna para alinhamento opcional
-        cols = st.columns([1, 0.4])
-        with cols[1]:
+        
             submit = st.form_submit_button("Entrar")
 
         if submit:
